@@ -35,9 +35,7 @@ if (GGML_RPC_RDMA)
     endif()
     target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_RDMA)
     if (APPLE)
-        # librdma.dylib only exists on macOS 26.2 and later. Link it weakly so a build made
-        # where it exists still loads where it does not; checked at runtime before use.
-        target_link_options(ggml-rpc PRIVATE "LINKER:-weak_library,${RDMA_LIB}")
+        target_link_libraries(ggml-rpc PRIVATE ${RDMA_LIB})
         target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_RDMA_APPLE)
         target_sources(ggml-rpc PRIVATE transport-apple.cpp)
     else()
