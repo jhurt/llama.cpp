@@ -40,6 +40,7 @@ if (GGML_RPC_RDMA)
         # but with BUILD_SHARED_LIBS=OFF ggml-rpc is a static archive and never links
         # so the librdma symbols used by transport-apple.cpp stay undefined.
         target_link_options(ggml-rpc PUBLIC "LINKER:-weak_library,${RDMA_LIB}")
+#        target_link_libraries(ggml-rpc PRIVATE ${RDMA_LIB})
         target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_RDMA_APPLE)
         target_sources(ggml-rpc PRIVATE transport-apple.cpp)
     else()

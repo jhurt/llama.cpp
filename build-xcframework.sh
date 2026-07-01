@@ -11,16 +11,17 @@ TVOS_MIN_OS_VERSION=16.4
 
 BUILD_SHARED_LIBS=OFF
 LLAMA_BUILD_APP=OFF
-LLAMA_BUILD_COMMON=OFF
+LLAMA_BUILD_COMMON=ON
 LLAMA_BUILD_EXAMPLES=OFF
-LLAMA_BUILD_TOOLS=OFF
+LLAMA_BUILD_TOOLS=ON
 LLAMA_BUILD_TESTS=OFF
-LLAMA_BUILD_SERVER=OFF
+LLAMA_BUILD_SERVER=ON
 LLAMA_BUILD_MTMD=ON
 GGML_METAL=ON
 GGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY:-ON}
 GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
+GGML_RPC=ON
 
 # Max number of concurrent platform builds
 MAX_PARALLEL_BUILDS=1
@@ -59,8 +60,8 @@ for b in "${BUILDS[@]}"; do
     fi
 done
 
-COMMON_C_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g"
-COMMON_CXX_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g"
+COMMON_C_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g -O3 -flto"
+COMMON_CXX_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g -O3 -flto"
 
 # Common options for all builds
 COMMON_CMAKE_ARGS=(
@@ -68,7 +69,7 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
     -DCMAKE_XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT="dwarf-with-dsym"
-    -DCMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=YES
+    -DCMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=NO
     -DCMAKE_XCODE_ATTRIBUTE_COPY_PHASE_STRIP=NO
     -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO
     -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
@@ -80,11 +81,13 @@ COMMON_CMAKE_ARGS=(
     -DLLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS}
     -DLLAMA_BUILD_SERVER=${LLAMA_BUILD_SERVER}
     -DLLAMA_BUILD_MTMD=${LLAMA_BUILD_MTMD}
+    -DLLAMA_TOOLS_INSTALL="OFF"
     -DGGML_METAL_EMBED_LIBRARY=${GGML_METAL_EMBED_LIBRARY}
     -DGGML_BLAS_DEFAULT=${GGML_BLAS_DEFAULT}
     -DGGML_METAL=${GGML_METAL}
     -DGGML_NATIVE=OFF
     -DGGML_OPENMP=${GGML_OPENMP}
+    -DGGML_RPC=${GGML_RPC}
 )
 
 check_required_tool() {
@@ -165,6 +168,7 @@ setup_framework_structure() {
     cp ggml/include/ggml-metal.h   ${header_path}
     cp ggml/include/ggml-cpu.h     ${header_path}
     cp ggml/include/ggml-blas.h    ${header_path}
+    cp ggml/include/ggml-rpc.h     ${header_path}
     cp ggml/include/gguf.h         ${header_path}
     cp tools/mtmd/mtmd.h           ${header_path}
     cp tools/mtmd/mtmd-helper.h    ${header_path}
@@ -290,16 +294,17 @@ combine_static_libraries() {
         output_lib="${build_dir}/framework/${framework_name}.framework/${framework_name}"
     fi
 
-    local libs=(
-        "${base_dir}/${build_dir}/src/${release_dir}/libllama.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-base.a"
-        "${base_dir}/${build_dir}/ggml/src/${release_dir}/libggml-cpu.a"
-        "${base_dir}/${build_dir}/ggml/src/ggml-metal/${release_dir}/libggml-metal.a"
-        "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/libggml-blas.a"
-        "${base_dir}/${build_dir}/tools/mtmd/${release_dir}/libmtmd.a"
-        "${base_dir}/${build_dir}/vendor/hash/${release_dir}/libvendor-hash.a"
-    )
+    local libs=()
+    echo "Including static libraries for ${platform}:"
+    while IFS= read -r lib_path; do
+        echo "  + ${lib_path}"
+        libs+=("$lib_path")
+    done < <(find "${base_dir}/${build_dir}" -name "*.a" -not -path "*/temp/*")
+
+    if [[ ${#libs[@]} -eq 0 ]]; then
+        echo "Error: No static libraries found in ${base_dir}/${build_dir}" >&2
+        exit 1
+    fi
 
     # Create temporary directory for processing
     local temp_dir="${base_dir}/${build_dir}/temp"
@@ -307,7 +312,7 @@ combine_static_libraries() {
 
     # Since we have multiple architectures libtool will find object files that do not
     # match the target architecture. We suppress these warnings.
-    xcrun libtool -static -o "${temp_dir}/combined.a" "${libs[@]}" 2> /dev/null
+    xcrun libtool -static -o "${temp_dir}/combined.a" "${libs[@]}"
 
     # Determine SDK, architectures, and install_name based on platform and simulator flag.
     local sdk=""
@@ -330,7 +335,7 @@ combine_static_libraries() {
             ;;
         "macos")
             sdk="macosx"
-            archs="arm64 x86_64"
+            archs="arm64"
             min_version_flag="-mmacosx-version-min=${MACOS_MIN_OS_VERSION}"
             install_name="@rpath/llama.framework/Versions/Current/llama"
             ;;
@@ -369,12 +374,19 @@ combine_static_libraries() {
 
     # Create dynamic library
     echo "Creating dynamic library for ${platform}."
+
+    local rdma_link=""
+    if [[ "$platform" == "macos" ]]; then
+        rdma_link="-lrdma"
+    fi
+
     xcrun -sdk $sdk clang++ -dynamiclib \
         -isysroot $(xcrun --sdk $sdk --show-sdk-path) \
         $arch_flags \
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
-        -framework Foundation -framework Metal -framework Accelerate \
+        -framework Foundation -framework Metal -framework Accelerate -framework Network \
+        $rdma_link \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"
 
@@ -492,7 +504,7 @@ build_macos() {
     cmake -B build-macos -G Xcode \
         "${COMMON_CMAKE_ARGS[@]}" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOS_MIN_OS_VERSION} \
-        -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+        -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
         -DLLAMA_OPENSSL=OFF \
