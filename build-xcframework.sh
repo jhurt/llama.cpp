@@ -15,12 +15,13 @@ LLAMA_BUILD_COMMON=OFF
 LLAMA_BUILD_EXAMPLES=OFF
 LLAMA_BUILD_TOOLS=OFF
 LLAMA_BUILD_TESTS=OFF
-LLAMA_BUILD_SERVER=OFF
+LLAMA_BUILD_SERVER=ON
 LLAMA_BUILD_MTMD=ON
 GGML_METAL=ON
 GGML_METAL_EMBED_LIBRARY=ON
 GGML_BLAS_DEFAULT=ON
 GGML_OPENMP=OFF
+GGML_RPC=ON
 
 # Max number of concurrent platform builds
 MAX_PARALLEL_BUILDS=1
@@ -59,8 +60,8 @@ for b in "${BUILDS[@]}"; do
     fi
 done
 
-COMMON_C_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g"
-COMMON_CXX_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g"
+COMMON_C_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g -O3 -flto"
+COMMON_CXX_FLAGS="-Wno-macro-redefined -Wno-shorten-64-to-32 -Wno-unused-command-line-argument -g -O3 -flto"
 
 # Common options for all builds
 COMMON_CMAKE_ARGS=(
@@ -68,7 +69,7 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
     -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
     -DCMAKE_XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT="dwarf-with-dsym"
-    -DCMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=YES
+    -DCMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=NO
     -DCMAKE_XCODE_ATTRIBUTE_COPY_PHASE_STRIP=NO
     -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO
     -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
@@ -85,6 +86,7 @@ COMMON_CMAKE_ARGS=(
     -DGGML_METAL=${GGML_METAL}
     -DGGML_NATIVE=OFF
     -DGGML_OPENMP=${GGML_OPENMP}
+    -DGGML_RPC=${GGML_RPC}
 )
 
 check_required_tool() {
@@ -165,6 +167,7 @@ setup_framework_structure() {
     cp ggml/include/ggml-metal.h   ${header_path}
     cp ggml/include/ggml-cpu.h     ${header_path}
     cp ggml/include/ggml-blas.h    ${header_path}
+    cp ggml/include/ggml-rpc.h     ${header_path}
     cp ggml/include/gguf.h         ${header_path}
     cp tools/mtmd/mtmd.h           ${header_path}
     cp tools/mtmd/mtmd-helper.h    ${header_path}
@@ -291,6 +294,7 @@ combine_static_libraries() {
         "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/libggml-blas.a"
         "${base_dir}/${build_dir}/tools/mtmd/${release_dir}/libmtmd.a"
         "${base_dir}/${build_dir}/vendor/hash/${release_dir}/libvendor-hash.a"
+        "${base_dir}/${build_dir}/ggml/src/ggml-rpc/${release_dir}/libggml-rpc.a"
     )
 
     # Create temporary directory for processing
@@ -299,7 +303,7 @@ combine_static_libraries() {
 
     # Since we have multiple architectures libtool will find object files that do not
     # match the target architecture. We suppress these warnings.
-    xcrun libtool -static -o "${temp_dir}/combined.a" "${libs[@]}" 2> /dev/null
+    xcrun libtool -static -o "${temp_dir}/combined.a" "${libs[@]}"
 
     # Determine SDK, architectures, and install_name based on platform and simulator flag.
     local sdk=""
@@ -322,7 +326,7 @@ combine_static_libraries() {
             ;;
         "macos")
             sdk="macosx"
-            archs="arm64 x86_64"
+            archs="arm64"
             min_version_flag="-mmacosx-version-min=${MACOS_MIN_OS_VERSION}"
             install_name="@rpath/llama.framework/Versions/Current/llama"
             ;;
@@ -366,7 +370,7 @@ combine_static_libraries() {
         $arch_flags \
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
-        -framework Foundation -framework Metal -framework Accelerate \
+        -framework Foundation -framework Metal -framework Accelerate -framework Network \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"
 
@@ -482,7 +486,7 @@ build_macos() {
     cmake -B build-macos -G Xcode \
         "${COMMON_CMAKE_ARGS[@]}" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOS_MIN_OS_VERSION} \
-        -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+        -DCMAKE_OSX_ARCHITECTURES="arm64" \
         -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
         -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
         -DLLAMA_OPENSSL=OFF \
