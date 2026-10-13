@@ -15,6 +15,11 @@
 #include <limits>
 #include <cmath>
 
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <unistd.h>
+#include <cmath>
+#include <algorithm>
+
 // threadgroups needed to fill the GPU
 // TODO: dedup
 static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
@@ -480,7 +485,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
+//                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
+                n_fuse = ggml_metal_op_flash_attn_mps(ctx, idx);
             } break;
         case GGML_OP_SET:
             {
@@ -4229,6 +4235,324 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     }
 
     return n_fuse;
+}
+
+static MPSGraphTensorData * ggml_metal_create_tensor_data(
+    id<MTLDevice> device,
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLBuffer> sourceBuffer,
+    size_t byteOffset,
+    NSArray<NSNumber *> * shape,
+    MPSDataType dataType,
+    size_t totalBytes,
+    id<MTLBuffer> * outTemporaryBuffer) {
+
+    *outTemporaryBuffer = nil;
+
+    if (byteOffset == 0) {
+        return [[MPSGraphTensorData alloc] initWithMTLBuffer:sourceBuffer
+                                                       shape:shape
+                                                    dataType:dataType];
+    }
+
+    const uintptr_t baseAddress = (uintptr_t)sourceBuffer.contents + byteOffset;
+    const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+
+    if ((baseAddress % pageSize) == 0) {
+        const size_t alignedLength = (totalBytes + pageSize - 1) & ~(pageSize - 1);
+        id<MTLBuffer> subBuffer = [device newBufferWithBytesNoCopy:(void *)baseAddress
+                                                            length:alignedLength
+                                                           options:sourceBuffer.resourceOptions
+                                                       deallocator:nil];
+        if (subBuffer) {
+            return [[MPSGraphTensorData alloc] initWithMTLBuffer:subBuffer
+                                                           shape:shape
+                                                        dataType:dataType];
+        }
+    }
+
+    id<MTLBuffer> temporaryBuffer = [device newBufferWithLength:totalBytes
+                                                        options:MTLResourceStorageModeShared];
+    *outTemporaryBuffer = temporaryBuffer;
+
+    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+    [blitEncoder copyFromBuffer:sourceBuffer
+                   sourceOffset:byteOffset
+                       toBuffer:temporaryBuffer
+              destinationOffset:0
+                           size:totalBytes];
+    [blitEncoder endEncoding];
+
+    return [[MPSGraphTensorData alloc] initWithMTLBuffer:temporaryBuffer
+                                                   shape:shape
+                                                dataType:dataType];
+}
+
+int ggml_metal_op_flash_attn_mps(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_tensor * queryTensor = op->src[0];
+    ggml_tensor * keyTensor   = op->src[1];
+    ggml_tensor * valueTensor = op->src[2];
+    ggml_tensor * maskTensor  = op->src[3];
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, queryTensor, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, queryTensor, nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, keyTensor,   ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, keyTensor,   nb);
+    GGML_TENSOR_LOCALS( int32_t, ne2, valueTensor, ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb2, valueTensor, nb);
+    GGML_TENSOR_LOCALS( int32_t, ne3, maskTensor,  ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb3, maskTensor,  nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,          ne);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+    GGML_ASSERT(ne11 == ne21);
+    GGML_ASSERT(ne12 == ne22);
+
+    float scale = 0.0f;
+    float maxBias = 0.0f;
+    float logitSoftcap = 0.0f;
+
+    memcpy(&scale,        ((const int32_t *) op->op_params) + 0, sizeof(scale));
+    memcpy(&maxBias,     ((const int32_t *) op->op_params) + 1, sizeof(maxBias));
+    memcpy(&logitSoftcap, ((const int32_t *) op->op_params) + 2, sizeof(logitSoftcap));
+
+    if (scale == 0.0f) {
+        scale = 1.0f / sqrtf((float)ne00);
+    }
+    if (logitSoftcap != 0.0f) {
+        scale /= logitSoftcap;
+    }
+
+    const bool hasMask = maskTensor != NULL;
+
+    const bool useKvF16 = ggml_metal_op_flash_attn_ext_use_kv_f16(op);
+    ggml_metal_buffer_id bidK = ggml_metal_get_buffer_id(keyTensor);
+    ggml_metal_buffer_id bidV = ggml_metal_get_buffer_id(valueTensor);
+
+    if (useKvF16) {
+        ggml_metal_library_t lib = ctx->lib;
+        ggml_metal_encoder_t enc = ctx->enc;
+
+        ggml_metal_buffer_id bidDst = ggml_metal_get_buffer_id(op);
+        ggml_metal_buffer_id bidPad = bidDst;
+        bidPad.offs += ggml_nbytes(op);
+
+        ggml_metal_buffer_id bidBlk = bidPad;
+        bidBlk.offs += ggml_metal_op_flash_attn_ext_extra_pad(op);
+
+        ggml_metal_buffer_id bidTmp = bidBlk;
+        bidTmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
+
+        ggml_metal_buffer_id bidKvF16 = bidTmp;
+        bidKvF16.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op);
+
+        const bool vIsViewOfK = ggml_metal_op_flash_attn_ext_v_is_view_of_k(op);
+        const int32_t nblocks1 = (int32_t)((ne10 / ggml_blck_size(keyTensor->type)) * (int64_t)ne11 * ne12 * ne13);
+
+        auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(lib, op);
+        const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0), 256);
+
+        ggml_metal_kargs_flash_attn_ext_kv_f16 argsK = {
+            ne10, ne11, ne12, ne13,
+            nb10, nb11, nb12, nb13,
+            nblocks1,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline0);
+        ggml_metal_encoder_set_bytes(enc, &argsK, sizeof(argsK), 0);
+        ggml_metal_encoder_set_buffer(enc, bidK, 1);
+        ggml_metal_encoder_set_buffer(enc, bidKvF16, 2);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (nblocks1 + nth - 1) / nth, 1, 1, nth, 1, 1);
+
+        if (!vIsViewOfK) {
+            ggml_metal_buffer_id bidVF16 = bidKvF16;
+            bidVF16.offs += ggml_metal_op_flash_attn_ext_kv_f16_k_size(op);
+
+            const int32_t nblocks2 = (int32_t)((ne20 / ggml_blck_size(valueTensor->type)) * (int64_t)ne21 * ne22 * ne23);
+            ggml_metal_kargs_flash_attn_ext_kv_f16 argsV = {
+                ne20, ne21, ne22, ne23,
+                nb20, nb21, nb22, nb23,
+                nblocks2,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline0);
+            ggml_metal_encoder_set_bytes(enc, &argsV, sizeof(argsV), 0);
+            ggml_metal_encoder_set_buffer(enc, bidV, 1);
+            ggml_metal_encoder_set_buffer(enc, bidVF16, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (nblocks2 + nth - 1) / nth, 1, 1, nth, 1, 1);
+
+            bidV = bidVF16;
+        } else {
+            bidV = bidKvF16;
+        }
+
+        bidK = bidKvF16;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = ggml_metal_encoder_end(ctx->enc);
+    id<MTLDevice> device = commandBuffer.device;
+
+    const int64_t batchSize        = ne03;
+    const int64_t queryHeads       = ne02;
+    const int64_t kvHeads          = ne12;
+    const int64_t sequenceLengthQ  = ne01;
+    const int64_t sequenceLengthKV = ne11;
+    const int64_t headDimension    = ne00;
+
+    const MPSDataType queryDataType = (queryTensor->type == GGML_TYPE_F32) ? MPSDataTypeFloat32 : MPSDataTypeFloat16;
+    const MPSDataType kvDataType    = useKvF16 ? MPSDataTypeFloat16 : ((keyTensor->type == GGML_TYPE_F32) ? MPSDataTypeFloat32 : MPSDataTypeFloat16);
+    const MPSDataType maskDataType  = hasMask ? ((maskTensor->type == GGML_TYPE_F32) ? MPSDataTypeFloat32 : MPSDataTypeFloat16) : MPSDataTypeFloat32;
+
+    @autoreleasepool {
+        static NSMutableDictionary<NSString *, MPSGraphExecutable *> * executableCache = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            executableCache = [[NSMutableDictionary alloc] init];
+        });
+
+        NSString * executableKey = [NSString stringWithFormat:@"b%lld_qh%lld_kvh%lld_d%lld_qdt%u_kvdt%u_mask%d",
+                                    batchSize, queryHeads, kvHeads, headDimension,
+                                    (unsigned)queryDataType, (unsigned)kvDataType, hasMask];
+
+        MPSGraphExecutable * executable = executableCache[executableKey];
+
+        if (!executable) {
+            MPSGraphDevice * graphDevice = [MPSGraphDevice deviceWithMTLDevice:device];
+            MPSGraph * graph = [[MPSGraph alloc] init];
+
+            NSArray<NSNumber *> * dynamicQShape  = @[@(batchSize), @(queryHeads), @(-1), @(headDimension)];
+            NSArray<NSNumber *> * dynamicKVShape = @[@(batchSize), @(kvHeads),    @(-1), @(headDimension)];
+
+            MPSGraphTensor * mpsQ = [graph placeholderWithShape:dynamicQShape dataType:queryDataType name:@"mpsQ"];
+            MPSGraphTensor * mpsK = [graph placeholderWithShape:dynamicKVShape dataType:kvDataType name:@"mpsK"];
+            MPSGraphTensor * mpsV = [graph placeholderWithShape:dynamicKVShape dataType:kvDataType name:@"mpsV"];
+            MPSGraphTensor * mpsMask = nil;
+
+            if (queryDataType != kvDataType) {
+                mpsQ = [graph castTensor:mpsQ toType:kvDataType name:@"castQ"];
+            }
+
+            if (queryHeads != kvHeads) {
+                const int64_t gqaRatio = queryHeads / kvHeads;
+                NSArray<NSNumber *> * gqaReshapePattern = @[@(batchSize), @(kvHeads), @1, @(-1), @(headDimension)];
+                NSArray<NSNumber *> * gqaBroadcastShape = @[@(batchSize), @(kvHeads), @(gqaRatio), @(-1), @(headDimension)];
+                NSArray<NSNumber *> * gqaFinalShape     = @[@(batchSize), @(queryHeads), @(-1), @(headDimension)];
+
+                mpsK = [graph reshapeTensor:mpsK withShape:gqaReshapePattern name:@"reshapeK"];
+                mpsK = [graph broadcastTensor:mpsK toShape:gqaBroadcastShape name:@"broadcastK"];
+                mpsK = [graph reshapeTensor:mpsK withShape:gqaFinalShape name:@"flattenK"];
+
+                mpsV = [graph reshapeTensor:mpsV withShape:gqaReshapePattern name:@"reshapeV"];
+                mpsV = [graph broadcastTensor:mpsV toShape:gqaBroadcastShape name:@"broadcastV"];
+                mpsV = [graph reshapeTensor:mpsV withShape:gqaFinalShape name:@"flattenV"];
+            }
+
+            NSMutableDictionary * feeds = [NSMutableDictionary dictionaryWithCapacity:4];
+            feeds[mpsQ] = [[MPSGraphShapedType alloc] initWithShape:dynamicQShape dataType:queryDataType];
+            feeds[mpsK] = [[MPSGraphShapedType alloc] initWithShape:dynamicKVShape dataType:kvDataType];
+            feeds[mpsV] = [[MPSGraphShapedType alloc] initWithShape:dynamicKVShape dataType:kvDataType];
+
+            if (hasMask) {
+                NSArray<NSNumber *> * dynamicMaskShape = @[@(ne33), @(ne32), @(-1), @(-1)];
+                mpsMask = [graph placeholderWithShape:dynamicMaskShape dataType:maskDataType name:@"mpsMask"];
+                if (maskDataType != kvDataType) {
+                    mpsMask = [graph castTensor:mpsMask toType:kvDataType name:@"castMask"];
+                }
+                feeds[mpsMask] = [[MPSGraphShapedType alloc] initWithShape:dynamicMaskShape dataType:maskDataType];
+            }
+
+            MPSGraphTensor * result = [graph scaledDotProductAttentionWithQueryTensor:mpsQ
+                                                                            keyTensor:mpsK
+                                                                          valueTensor:mpsV
+                                                                           maskTensor:mpsMask
+                                                                                scale:scale
+                                                                                 name:@"sdpa"];
+
+            if (result.dataType != queryDataType) {
+                result = [graph castTensor:result toType:queryDataType name:@"castResult"];
+            }
+
+            MPSGraphCompilationDescriptor * descriptor = [[MPSGraphCompilationDescriptor alloc] init];
+            descriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+            descriptor.reducedPrecisionFastMath = MPSGraphReducedPrecisionFastMathAllowFP16Intermediates;
+
+            executable = [graph compileWithDevice:graphDevice
+                                            feeds:feeds
+                                    targetTensors:@[result]
+                                 targetOperations:nil
+                            compilationDescriptor:descriptor];
+
+            executableCache[executableKey] = executable;
+        }
+
+        NSArray<NSNumber *> * concreteQShape  = @[@(batchSize), @(queryHeads), @(sequenceLengthQ),  @(headDimension)];
+        NSArray<NSNumber *> * concreteKVShape = @[@(batchSize), @(kvHeads),    @(sequenceLengthKV), @(headDimension)];
+
+        ggml_metal_buffer_id bidQ   = ggml_metal_get_buffer_id(queryTensor);
+        ggml_metal_buffer_id bidDst = ggml_metal_get_buffer_id(op);
+
+        id<MTLBuffer> mtlBufferQ   = (__bridge id<MTLBuffer>)bidQ.metal;
+        id<MTLBuffer> mtlBufferK   = (__bridge id<MTLBuffer>)bidK.metal;
+        id<MTLBuffer> mtlBufferV   = (__bridge id<MTLBuffer>)bidV.metal;
+        id<MTLBuffer> mtlBufferDst = (__bridge id<MTLBuffer>)bidDst.metal;
+
+        id<MTLBuffer> tempQ = nil;
+        id<MTLBuffer> tempK = nil;
+        id<MTLBuffer> tempV = nil;
+        id<MTLBuffer> tempMask = nil;
+        id<MTLBuffer> tempDst = nil;
+
+        NSMutableArray * inputsArray = [NSMutableArray arrayWithCapacity:4];
+
+        [inputsArray addObject:ggml_metal_create_tensor_data(
+            device, commandBuffer, mtlBufferQ, bidQ.offs,
+            concreteQShape, queryDataType, ggml_nbytes(queryTensor), &tempQ)];
+
+        const size_t kBytes = useKvF16 ? (ne10 * ne11 * ne12 * ne13 * sizeof(ggml_fp16_t)) : ggml_nbytes(keyTensor);
+        [inputsArray addObject:ggml_metal_create_tensor_data(
+            device, commandBuffer, mtlBufferK, bidK.offs,
+            concreteKVShape, kvDataType, kBytes, &tempK)];
+
+        const size_t vBytes = useKvF16 ? (ne20 * ne21 * ne22 * ne23 * sizeof(ggml_fp16_t)) : ggml_nbytes(valueTensor);
+        [inputsArray addObject:ggml_metal_create_tensor_data(
+            device, commandBuffer, mtlBufferV, bidV.offs,
+            concreteKVShape, kvDataType, vBytes, &tempV)];
+
+        if (hasMask) {
+            NSArray<NSNumber *> * concreteMaskShape = @[@(ne33), @(ne32), @(ne31), @(ne30)];
+            ggml_metal_buffer_id bidMask = ggml_metal_get_buffer_id(maskTensor);
+            id<MTLBuffer> mtlBufferMask = (__bridge id<MTLBuffer>)bidMask.metal;
+
+            [inputsArray addObject:ggml_metal_create_tensor_data(
+                device, commandBuffer, mtlBufferMask, bidMask.offs,
+                concreteMaskShape, maskDataType, ggml_nbytes(maskTensor), &tempMask)];
+        }
+
+        MPSGraphTensorData * outputData = ggml_metal_create_tensor_data(
+            device, commandBuffer, mtlBufferDst, bidDst.offs,
+            concreteQShape, queryDataType, ggml_nbytes(op), &tempDst);
+
+        [executable encodeToCommandBuffer:commandBuffer
+                              inputsArray:inputsArray
+                             resultsArray:@[outputData]
+                      executionDescriptor:nil];
+
+        if (tempDst) {
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            [blitEncoder copyFromBuffer:tempDst
+                           sourceOffset:0
+                               toBuffer:mtlBufferDst
+                      destinationOffset:bidDst.offs
+                                   size:ggml_nbytes(op)];
+            [blitEncoder endEncoding];
+        }
+    }
+
+    ggml_metal_encoder_resume(ctx->enc, commandBuffer);
+
+    return 1;
 }
 
 int ggml_metal_op_silu_back(ggml_metal_op_t ctx, int idx) {

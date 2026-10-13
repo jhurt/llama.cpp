@@ -5,7 +5,7 @@
 #
 # Options
 IOS_MIN_OS_VERSION=16.4
-MACOS_MIN_OS_VERSION=13.3
+MACOS_MIN_OS_VERSION=26.0
 VISIONOS_MIN_OS_VERSION=1.0
 TVOS_MIN_OS_VERSION=16.4
 
@@ -193,6 +193,7 @@ framework module llama {
     link framework "Accelerate"
     link framework "Metal"
     link framework "Foundation"
+    link framework "MetalPerformanceShadersGraph"
 
     export *
 }
@@ -388,7 +389,7 @@ combine_static_libraries() {
         $arch_flags \
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
-        -framework Foundation -framework Metal -framework Accelerate -framework Network \
+        -framework Foundation -framework Metal -framework Accelerate -framework Network -framework MetalPerformanceShadersGraph \
         $rdma_link \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"

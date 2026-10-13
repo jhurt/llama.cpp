@@ -91,6 +91,13 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+#if defined(__OBJC__)
+@protocol MTLCommandBuffer;
+
+id<MTLCommandBuffer> ggml_metal_encoder_end(ggml_metal_encoder_t enc);
+void                 ggml_metal_encoder_resume(ggml_metal_encoder_t enc, id<MTLCommandBuffer> cmd_buf);
+#endif
+
 //
 // MTLLibrary wrapper
 //

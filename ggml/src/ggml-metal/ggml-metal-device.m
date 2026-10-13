@@ -830,13 +830,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd_buf;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
-
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
     } else {
@@ -845,11 +845,15 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
     [res->obj retain];
 
+    res->cmd_buf = cmd_buf;
+    [res->cmd_buf retain];
+
     return res;
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     [encoder->obj release];
+    [encoder->cmd_buf release];
     free(encoder);
 }
 
@@ -918,6 +922,23 @@ struct ggml_metal_device {
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 };
+
+id<MTLCommandBuffer> ggml_metal_encoder_end(ggml_metal_encoder_t enc) {
+    if (!enc || !enc->obj) {
+        return nil;
+    }
+    id<MTLCommandBuffer> cmd_buf = enc->cmd_buf;
+    [enc->obj endEncoding];
+    enc->obj = nil;
+    return cmd_buf;
+}
+
+void ggml_metal_encoder_resume(ggml_metal_encoder_t enc, id<MTLCommandBuffer> cmd_buf) {
+    if (enc && cmd_buf) {
+        enc->cmd_buf = cmd_buf;
+        enc->obj = [cmd_buf computeCommandEncoder];
+    }
+}
 
 //
 // MTLResidenceSet wrapper

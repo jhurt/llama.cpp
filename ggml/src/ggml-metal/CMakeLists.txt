@@ -1,6 +1,7 @@
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK    Metal      REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+find_library(MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
 
 message(STATUS "Metal framework found")
 
@@ -11,7 +12,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-common.cpp
                          ggml-metal-context.m
                          ggml-metal-fusion.cpp
-                         ggml-metal-ops.cpp
+                         ggml-metal-ops.mm
                          ggml-metal-tuning.cpp
                         )
 
@@ -20,6 +21,8 @@ target_link_libraries(ggml-metal PRIVATE
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
                       )
+
+target_link_libraries(ggml-metal PUBLIC ${MPSGRAPH_FRAMEWORK})
 
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
